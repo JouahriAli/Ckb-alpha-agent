@@ -1,0 +1,32 @@
+# API keys in MCP config
+.mcp.json
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Environment
+.env
+*.key
+
+# IDE
+.vscode/
+.idea/
+
+# Data
+*.db
+
+# Fiber node runtime data (keys, store, binaries)
+fiber-nodes/*/ckb/key
+fiber-nodes/*/ckb/exported-key
+fiber-nodes/*/fiber/sk
+fiber-nodes/*/fiber/store/
+fiber-nodes/*/fnn
+fiber-nodes/fnn
+fiber-nodes/fnn-migrate
+fiber-nodes/*.tar.gz
+
+# Claude
+.claude/

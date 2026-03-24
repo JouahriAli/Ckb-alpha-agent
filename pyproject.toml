@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "ckb-alpha-agent"
+version = "0.1.0"
+description = "Verifiable Alpha Oracle — autonomous AI agent for on-chain token momentum analysis on CKB"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "numpy>=1.26",
+    "scipy>=1.12",
+    "starlette>=0.36",
+    "uvicorn>=0.27",
+    "anthropic>=0.40",
+    "aiosqlite>=0.20",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]

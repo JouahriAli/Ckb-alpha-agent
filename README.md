@@ -1,0 +1,154 @@
+# CKB Alpha Agent — Verifiable Alpha Oracle
+
+An autonomous AI agent that monitors token momentum via statistical analysis, accepts micropayments over the Fiber Network (CKB L2), and publishes verifiable proof cells on CKB L1.
+
+**Pay → Analyze → Prove.**
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         USER                                    │
+│  (Fiber node + CLI/web interface)                               │
+└──────────┬──────────────────────────────────────────────────────┘
+           │ 1. Request (token address via API)
+           │ 2. Receive Fiber invoice
+           │ 3. Pay invoice
+           │ 6. Receive result summary + proof hash + CKB cell
+           │
+┌──────────▼──────────────────────────────────────────────────────┐
+│                      AGENT SERVER                                │
+│                                                                  │
+│  ┌─────────────┐   ┌──────────────┐   ┌──────────────────────┐  │
+│  │ Fiber RPC   │   │ Agent Core   │   │ CKB L1 Publisher     │  │
+│  │ Client      │   │ (Python)     │   │                      │  │
+│  │             │   │              │   │ - Build Result Cell   │  │
+│  │ - Invoice   │   │ - Orchestr.  │   │   (109-byte blob)    │  │
+│  │ - Payment   │   │ - Dispatch   │   │ - Sign & Submit TX   │  │
+│  │   verify    │   │              │   │                      │  │
+│  └─────────────┘   └──────┬───────┘   └──────────────────────┘  │
+│                           │                                      │
+│                    ┌──────▼───────┐                               │
+│                    │   Tools      │                               │
+│                    │              │                               │
+│                    │ Data Fetcher │  → Birdeye / DEXScreener     │
+│                    │ Alpha Brain  │  → Statistical pipeline       │
+│                    │ LLM Analyst  │  → Claude interpretation      │
+│                    └──────────────┘                               │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+## Quickstart
+
+### 1. Install
+
+```bash
+pip install -e .
+```
+
+### 2. Set environment variables
+
+```bash
+export BIRDEYE_API_KEY="your-birdeye-api-key"
+export ANTHROPIC_API_KEY="your-anthropic-api-key"  # optional, for LLM narrative
+export FIBER_RPC_URL="http://localhost:8227"        # optional, for payment flow
+```
+
+### 3. Run the server
+
+```bash
+python proof_server.py
+# → Starting Alpha Oracle on port 8080...
+```
+
+### 4. Analyze a token (demo endpoint, skips payment)
+
+```bash
+curl -X POST http://localhost:8080/analyze \
+  -H 'Content-Type: application/json' \
+  -d '{"token_address": "So11111111111111111111111111111111111111112", "chain": "solana"}'
+```
+
+### 5. Verify a proof
+
+```bash
+# Use the proof_hash from the response:
+curl http://localhost:8080/proof/{proof_hash}
+```
+
+### Example response (abbreviated)
+
+```json
+{
+  "token_id": "solana:So111...",
+  "pair": "SOL/USDC",
+  "confidence_tier": 1,
+  "confidence_label": "High",
+  "sample_n": 247,
+  "stats": {
+    "volume_zscore": 3.1415,
+    "excess_kurtosis": 5.221,
+    "skewness": 1.87,
+    "signal_momentum": 2.4102,
+    "liquidity_thinness": 0.0000034,
+    "liquidity_usd": 12500000.0
+  },
+  "narrative": "Strong accumulation signal...",
+  "proof_hash": "a1b2c3...",
+  "proof_url": "/proof/a1b2c3...",
+  "ckb_result_cell": {
+    "data_hex": "0x...",
+    "data_hash": "d4e5f6...",
+    "data_size_bytes": 109,
+    "capacity_ckb": 200
+  }
+}
+```
+
+## The Math: Signal-to-Noise Momentum (S_m)
+
+The core metric uses a log-additive (geometric) structure — all factors must be elevated for a high score:
+
+```
+log(S_m) = 0.4·log(|z|) + 0.3·log(1 + |κ_eff|) + 0.15·log(1 + |γ_eff|)
+```
+
+Where:
+- **z** — Volume Z-score (anomaly detection vs. 7-day hourly baseline)
+- **κ_eff** — Excess kurtosis × Jarque-Bera weight (heavy tails = whale activity)
+- **γ_eff** — Skewness × Jarque-Bera weight (directional bias)
+
+The Jarque-Bera p-value acts as a continuous damper: when the distribution is normal (p → 1), higher moments shrink gracefully to zero. No information is discarded.
+
+Liquidity thinness (`median(trade_size) / pool_TVL`) is reported alongside S_m, not baked in — a whale accumulating in a deep pool is *more* significant, not less.
+
+## Payment Flow (Fiber Network)
+
+For the full paid flow (not just the demo shortcut):
+
+1. `POST /request` → Agent creates a Fiber invoice, returns it
+2. User pays the invoice via their Fiber node
+3. Agent detects payment → runs pipeline → publishes CKB Result Cell
+4. `GET /result/{payment_hash}` → Poll for results
+
+## CKB L1 Result Cell
+
+The agent builds a compact 109-byte binary blob per the [spec](SPEC.md):
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 32 | token_id_hash (blake2b) |
+| 32 | 8 | timestamp (u64 LE) |
+| 40 | 4 | sample_n (u32 LE) |
+| 44 | 8 | volume_zscore (f64 LE) |
+| 52 | 8 | excess_kurtosis (f64 LE) |
+| 60 | 8 | skewness (f64 LE) |
+| 68 | 1 | confidence_tier (u8) |
+| 69 | 8 | signal_momentum (f64 LE) |
+| 77 | 32 | full_proof_hash (blake2b) |
+
+Verifiable: `blake2b(proof_blob_json) == full_proof_hash` on-chain.
+
+## Full Spec
+
+See [SPEC.md](SPEC.md) for complete technical details.
