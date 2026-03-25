@@ -188,7 +188,7 @@ class FiberClient:
 		while time.time() - start < timeout:
 			status = await self.get_invoice_status(payment_hash)
 
-			if status.status == "Received":
+			if status.status in ("Received", "Paid"):
 				return status
 			if status.status == "Cancelled":
 				raise RuntimeError(
