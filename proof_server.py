@@ -37,7 +37,8 @@ from ckb_publisher import build_result_cell, publish_result_cell
 # ---------------------------------------------------------------------------
 
 BIRDEYE_API_KEY = os.environ.get("BIRDEYE_API_KEY", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+LLM_BACKEND = os.environ.get("LLM_BACKEND", "anthropic")
+LLM_API_KEY = os.environ.get("OPENAI_API_KEY", "") or os.environ.get("ANTHROPIC_API_KEY", "")
 ANALYSIS_FEE_CKB = int(os.environ.get("ANALYSIS_FEE_CKB", "10"))
 FIBER_RPC_URL = os.environ.get("FIBER_RPC_URL", "http://localhost:8227")
 
@@ -164,9 +165,9 @@ async def run_pipeline(token_address: str, chain: str = "solana") -> dict:
 
 	# 4. LLM interpretation.
 	narrative = ""
-	if ANTHROPIC_API_KEY:
+	if LLM_API_KEY or LLM_BACKEND == "ollama":
 		try:
-			narrative = await interpret(report, ANTHROPIC_API_KEY)
+			narrative = await interpret(report, LLM_API_KEY)
 		except Exception as e:
 			narrative = f"LLM interpretation unavailable: {e}"
 	else:

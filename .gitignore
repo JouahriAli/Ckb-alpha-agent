@@ -28,5 +28,8 @@ fiber-nodes/fnn
 fiber-nodes/fnn-migrate
 fiber-nodes/*.tar.gz
 
+# Fiber node backups
+fiber-nodes/backups/
+
 # Claude
 .claude/

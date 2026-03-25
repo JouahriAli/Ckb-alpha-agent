@@ -4,11 +4,15 @@ LLM Analyst — interprets statistical reports into human-readable narratives.
 This is where the LLM earns its keep. The statistical pipeline outputs numbers;
 this tool synthesizes them into a judgment about market behavior.
 
-Uses Claude Haiku for speed and cost — the interpretation is 2-3 sentences,
-not a dissertation.
+Supports multiple backends via LLM_BACKEND env var:
+  - "anthropic" (default) — Claude via Anthropic API or compatible proxy
+  - "openai"              — OpenAI API or any OpenAI-compatible endpoint
+  - "ollama"              — Local Ollama instance (no API key needed)
 """
 
 from __future__ import annotations
+
+import os
 
 from tools.alpha_brain import AlphaReport
 
@@ -53,21 +57,11 @@ def build_analysis_prompt(report: AlphaReport) -> str:
 
 
 # ---------------------------------------------------------------------------
-# LLM call
+# LLM backends
 # ---------------------------------------------------------------------------
 
-async def interpret(report: AlphaReport, api_key: str) -> str:
-	"""
-	Call Claude Haiku to interpret an AlphaReport.
-
-	Args:
-		report: The statistical report to interpret.
-		api_key: Anthropic API key.
-
-	Returns:
-		A 2-3 sentence human-readable interpretation.
-	"""
-	import os
+async def _interpret_anthropic(report: AlphaReport, api_key: str) -> str:
+	"""Call via Anthropic SDK (Claude or compatible proxy)."""
 	import anthropic
 
 	base_url = os.environ.get("ANTHROPIC_BASE_URL", None)
@@ -78,7 +72,7 @@ async def interpret(report: AlphaReport, api_key: str) -> str:
 	client = anthropic.AsyncAnthropic(**kwargs)
 
 	message = await client.messages.create(
-		model="claude-haiku-4-5-20251001",
+		model=os.environ.get("LLM_MODEL", "claude-haiku-4-5-20251001"),
 		max_tokens=300,
 		system=SYSTEM_PROMPT,
 		messages=[
@@ -87,3 +81,76 @@ async def interpret(report: AlphaReport, api_key: str) -> str:
 	)
 
 	return message.content[0].text
+
+
+async def _interpret_openai(report: AlphaReport, api_key: str) -> str:
+	"""Call via OpenAI-compatible API (OpenAI, share-ai w/ OpenAI, vLLM, etc.)."""
+	import httpx
+
+	base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+	model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+
+	async with httpx.AsyncClient(timeout=30.0) as client:
+		resp = await client.post(
+			f"{base_url}/chat/completions",
+			headers={
+				"Authorization": f"Bearer {api_key}",
+				"Content-Type": "application/json",
+			},
+			json={
+				"model": model,
+				"max_tokens": 300,
+				"messages": [
+					{"role": "system", "content": SYSTEM_PROMPT},
+					{"role": "user", "content": build_analysis_prompt(report)},
+				],
+			},
+		)
+		resp.raise_for_status()
+		return resp.json()["choices"][0]["message"]["content"]
+
+
+async def _interpret_ollama(report: AlphaReport, api_key: str) -> str:
+	"""Call a local Ollama instance (no API key needed)."""
+	import httpx
+
+	base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+	model = os.environ.get("LLM_MODEL", "llama3.2")
+
+	async with httpx.AsyncClient(timeout=60.0) as client:
+		resp = await client.post(
+			f"{base_url}/api/chat",
+			json={
+				"model": model,
+				"stream": False,
+				"messages": [
+					{"role": "system", "content": SYSTEM_PROMPT},
+					{"role": "user", "content": build_analysis_prompt(report)},
+				],
+			},
+		)
+		resp.raise_for_status()
+		return resp.json()["message"]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Public interface
+# ---------------------------------------------------------------------------
+
+_BACKENDS = {
+	"anthropic": _interpret_anthropic,
+	"openai": _interpret_openai,
+	"ollama": _interpret_ollama,
+}
+
+async def interpret(report: AlphaReport, api_key: str) -> str:
+	"""
+	Interpret an AlphaReport using the configured LLM backend.
+
+	Backend is selected via LLM_BACKEND env var (default: "anthropic").
+	"""
+	backend = os.environ.get("LLM_BACKEND", "anthropic")
+	fn = _BACKENDS.get(backend)
+	if fn is None:
+		raise ValueError(f"Unknown LLM_BACKEND={backend!r}. Options: {list(_BACKENDS.keys())}")
+	return await fn(report, api_key)

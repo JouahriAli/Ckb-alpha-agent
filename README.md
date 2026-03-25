@@ -50,8 +50,26 @@ pip install -e .
 
 ```bash
 export BIRDEYE_API_KEY="your-birdeye-api-key"
-export ANTHROPIC_API_KEY="your-anthropic-api-key"  # optional, for LLM narrative
-export FIBER_RPC_URL="http://localhost:8227"        # optional, for payment flow
+
+# LLM backend — pick one:
+# Option A: Anthropic (default)
+export LLM_BACKEND="anthropic"
+export ANTHROPIC_API_KEY="your-key"
+# export ANTHROPIC_BASE_URL="https://share-ai.ckbdev.com"  # optional proxy
+
+# Option B: OpenAI or any OpenAI-compatible endpoint
+export LLM_BACKEND="openai"
+export OPENAI_API_KEY="your-key"
+# export OPENAI_BASE_URL="https://api.openai.com/v1"       # default
+# export LLM_MODEL="gpt-4o-mini"                           # default
+
+# Option C: Ollama (local, no API key needed)
+export LLM_BACKEND="ollama"
+# export OLLAMA_BASE_URL="http://localhost:11434"           # default
+# export LLM_MODEL="llama3.2"                              # default
+
+# Fiber (optional, for payment flow)
+export FIBER_RPC_URL="http://localhost:8227"
 ```
 
 ### 3. Run the server
