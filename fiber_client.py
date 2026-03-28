@@ -109,6 +109,7 @@ class FiberClient:
 		description: str = "Alpha Oracle analysis",
 		currency: str = "Fibt",
 		expiry_seconds: int = 3600,
+		preimage_hex: str | None = None,
 	) -> Invoice:
 		"""
 		Create a new invoice on our Fiber node.
@@ -118,11 +119,15 @@ class FiberClient:
 			description: Human-readable description.
 			currency: "Fibt" (testnet), "Fibb" (mainnet), "Fibd" (devnet).
 			expiry_seconds: Invoice validity period.
+			preimage_hex: Optional 32-byte hex preimage. If provided, the
+				invoice's payment_hash = sha256(preimage). This enables
+				trustless data delivery: revealing the preimage (= the data
+				hash) settles the payment atomically.
 
 		Returns:
 			Invoice object with address and payment_hash for polling.
 		"""
-		preimage = "0x" + secrets.token_hex(32)
+		preimage = "0x" + (preimage_hex or secrets.token_hex(32))
 		amount_hex = ckb_to_hex_shannon(amount_ckb)
 
 		result = await self._call("new_invoice", [{

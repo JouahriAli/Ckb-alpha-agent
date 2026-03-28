@@ -1,14 +1,18 @@
 """
 Proof Server — HTTP API for the Alpha Oracle agent.
 
-Endpoints:
-	POST /request          — Submit analysis request, get Fiber invoice.
-	GET  /result/{pay_hash} — Poll for result after payment.
-	GET  /proof/{hash}      — Fetch full proof blob (verifiable via blake2b).
-	GET  /health            — Health check.
+Trustless Fiber payment flow:
+  1. POST /request          — Agent runs analysis, returns Fiber invoice
+                              (preimage = proof_hash, locked in TLC).
+  2. User pays invoice      — TLC settles, revealing proof_hash to user.
+  3. GET  /proof/{hash}     — User fetches full results with the proof_hash.
 
-For the hackathon demo, this also includes a /analyze endpoint that
-skips Fiber payment and runs the pipeline directly (for testing).
+Other endpoints:
+  GET  /result/{pay_hash}   — Poll payment settlement status.
+  GET  /health              — Health check.
+  POST /analyze             — Direct analysis (skips Fiber, for testing).
+  POST /demo/pay            — Demo: pay invoice from local user Fiber node.
+  GET  /demo/preimage/{ph}  — Demo: simulate preimage reveal after settlement.
 """
 
 from __future__ import annotations
@@ -21,15 +25,18 @@ import time
 
 import httpx
 import numpy as np
+from pathlib import Path
+
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.routing import Route
+from starlette.responses import JSONResponse, HTMLResponse
+from starlette.routing import Route, Mount
+from starlette.staticfiles import StaticFiles
 
 from tools.alpha_brain import Trade, AlphaReport, analyze
 from tools.data_fetcher import fetch_pair_context, estimate_hourly_baseline
 from tools.llm_analyst import interpret, build_analysis_prompt
-from fiber_client import FiberClient
+from fiber_client import FiberClient, SHANNON_PER_CKB
 from ckb_publisher import build_result_cell, publish_result_cell
 
 # ---------------------------------------------------------------------------
@@ -41,6 +48,9 @@ LLM_BACKEND = os.environ.get("LLM_BACKEND", "anthropic")
 LLM_API_KEY = os.environ.get("OPENAI_API_KEY", "") or os.environ.get("ANTHROPIC_API_KEY", "")
 ANALYSIS_FEE_CKB = int(os.environ.get("ANALYSIS_FEE_CKB", "10"))
 FIBER_RPC_URL = os.environ.get("FIBER_RPC_URL", "http://localhost:8227")
+AGENT_PEER_ID = os.environ.get("AGENT_PEER_ID", "")
+AGENT_P2P_HOST = os.environ.get("AGENT_P2P_HOST", "127.0.0.1")
+AGENT_P2P_PORT = os.environ.get("AGENT_P2P_PORT", "8228")
 
 # Fiber client (None if no Fiber node configured).
 fiber: FiberClient | None = None
@@ -227,28 +237,25 @@ async def run_pipeline(token_address: str, chain: str = "solana") -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Background: process paid requests
+# Background: payment watcher (trustless delivery)
 # ---------------------------------------------------------------------------
 
-async def process_paid_request(payment_hash: str, token_address: str, chain: str):
-	"""Run the analysis pipeline after payment is confirmed."""
-	try:
-		pending_requests[payment_hash]["status"] = "processing"
-		result = await run_pipeline(token_address, chain=chain)
-		result["payment_hash"] = payment_hash
-		results_store[payment_hash] = result
-		pending_requests[payment_hash]["status"] = "completed"
-	except Exception as e:
-		pending_requests[payment_hash]["status"] = "failed"
-		pending_requests[payment_hash]["error"] = str(e)
+async def payment_watcher(payment_hash: str, proof_hash: str):
+	"""
+	Poll Fiber invoice status. When paid, the user has received the
+	proof_hash as the TLC preimage — they can now fetch /proof/{hash}.
 
-
-async def payment_watcher(payment_hash: str, token_address: str, chain: str):
-	"""Poll Fiber invoice status, trigger pipeline when paid."""
+	Trustless flow:
+	  - Agent runs analysis FIRST, gets proof_hash.
+	  - Agent creates invoice with preimage = proof_hash.
+	  - User pays → TLC settles → user learns proof_hash (the preimage).
+	  - User calls GET /proof/{proof_hash} to retrieve full results.
+	  - Agent can't get paid without revealing proof_hash.
+	  - User can't get proof_hash without paying.
+	"""
 	try:
 		status = await fiber.wait_for_payment(payment_hash, poll_interval=2.0, timeout=3600.0)
-		pending_requests[payment_hash]["status"] = "paid"
-		await process_paid_request(payment_hash, token_address, chain)
+		pending_requests[payment_hash]["status"] = "settled"
 	except (TimeoutError, RuntimeError) as e:
 		pending_requests[payment_hash]["status"] = "expired"
 		pending_requests[payment_hash]["error"] = str(e)
@@ -277,16 +284,19 @@ async def health(request: Request) -> JSONResponse:
 async def request_analysis(request: Request) -> JSONResponse:
 	"""
 	POST /request
-	Submit an analysis request. Returns a Fiber invoice to pay.
+	Trustless analysis request. Runs pipeline FIRST, then creates a Fiber
+	invoice whose TLC preimage IS the proof_hash. Payment and data delivery
+	are atomic: the user can't learn the proof_hash without paying, and
+	the agent can't collect without revealing it.
 
 	Body: { "token_address": "...", "chain": "solana" }
 
 	Flow:
-	  1. Agent creates Fiber invoice for the analysis fee.
-	  2. Returns invoice to user.
-	  3. Background task polls for payment.
-	  4. On payment → run pipeline → store result.
-	  5. User polls GET /result/{payment_hash} for the result.
+	  1. Agent runs the full analysis pipeline → gets proof_hash.
+	  2. Agent creates Fiber invoice with preimage = proof_hash.
+	  3. Returns invoice to user (WITHOUT results or proof_hash).
+	  4. User pays → TLC settles → user learns proof_hash (the preimage).
+	  5. User calls GET /proof/{proof_hash} to retrieve full results.
 	"""
 	if not fiber:
 		return JSONResponse(
@@ -305,35 +315,57 @@ async def request_analysis(request: Request) -> JSONResponse:
 	if not token_address:
 		return JSONResponse({"error": "token_address is required."}, status_code=400)
 
-	# Create Fiber invoice.
+	# 1. Run pipeline FIRST to get the proof_hash.
+	try:
+		result = await run_pipeline(token_address, chain=chain)
+	except ValueError as e:
+		return JSONResponse({"error": str(e)}, status_code=404)
+	except Exception as e:
+		return JSONResponse({"error": f"Pipeline error: {e}"}, status_code=500)
+
+	proof_hash = result["proof_hash"]
+
+	# Store full result keyed by proof_hash (already in proof_store from run_pipeline).
+	results_store[proof_hash] = result
+
+	# 2. Create Fiber invoice with preimage = proof_hash.
+	#    payment_hash = sha256(proof_hash). When the TLC settles,
+	#    the user's node learns the preimage (= proof_hash).
 	try:
 		invoice = await fiber.create_invoice(
 			amount_ckb=ANALYSIS_FEE_CKB,
 			description=f"Alpha Oracle analysis: {token_address[:16]}",
+			preimage_hex=proof_hash,
 		)
 	except Exception as e:
 		return JSONResponse({"error": f"Failed to create invoice: {e}"}, status_code=502)
 
-	# Track the pending request.
+	# 3. Track the pending request.
 	pending_requests[invoice.payment_hash] = {
 		"token_address": token_address,
 		"chain": chain,
 		"status": "awaiting_payment",
+		"proof_hash": proof_hash,
 		"invoice_address": invoice.invoice_address,
 		"amount_ckb": ANALYSIS_FEE_CKB,
 		"created_at": int(time.time()),
 	}
 
-	# Start background payment watcher.
-	asyncio.create_task(payment_watcher(invoice.payment_hash, token_address, chain))
+	# 4. Start background payment watcher.
+	asyncio.create_task(payment_watcher(invoice.payment_hash, proof_hash))
 
+	# 5. Return invoice — NOT the results or proof_hash.
 	return JSONResponse({
 		"payment_hash": invoice.payment_hash,
 		"invoice": invoice.invoice_address,
 		"amount_ckb": ANALYSIS_FEE_CKB,
 		"expires_in_seconds": 3600,
-		"poll_url": f"/result/{invoice.payment_hash}",
-		"instructions": "Pay the invoice via your Fiber node, then poll the poll_url for results.",
+		"status": "awaiting_payment",
+		"instructions": (
+			"Pay the invoice via your Fiber node. "
+			"When the payment settles, your node will receive the preimage — "
+			"that IS the proof_hash. Use it to fetch results at GET /proof/{proof_hash}."
+		),
 	})
 
 
@@ -369,24 +401,34 @@ async def analyze_endpoint(request: Request) -> JSONResponse:
 
 async def get_result(request: Request) -> JSONResponse:
 	"""
-	GET /result/{payment_hash_or_request_id}
-	Poll for result. Works with both Fiber payment_hash and direct request_id.
+	GET /result/{payment_hash}
+	Poll for payment status. In the trustless flow, the actual results
+	are fetched via GET /proof/{proof_hash} once the user learns the
+	preimage from the TLC settlement.
 	"""
 	key = request.path_params["request_id"]
 
-	# Check completed results first.
+	# Check completed results (direct /analyze requests keyed by request_id).
 	result = results_store.get(key)
 	if result is not None:
 		return JSONResponse(result)
 
-	# Check pending requests.
+	# Check pending Fiber requests (keyed by payment_hash).
 	pending = pending_requests.get(key)
 	if pending is not None:
-		return JSONResponse({
+		resp = {
 			"payment_hash": key,
 			"status": pending["status"],
-			"error": pending.get("error"),
-		})
+		}
+		if pending.get("error"):
+			resp["error"] = pending["error"]
+		# Once settled, tell the user to check their node for the preimage.
+		if pending["status"] == "settled":
+			resp["message"] = (
+				"Payment settled. The TLC preimage revealed to your node "
+				"is the proof_hash. Use GET /proof/{proof_hash} to fetch results."
+			)
+		return JSONResponse(resp)
 
 	return JSONResponse({"error": "Not found.", "key": key}, status_code=404)
 
@@ -404,16 +446,250 @@ async def get_proof(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Demo: simulate user payment from local Fiber node
+# ---------------------------------------------------------------------------
+
+USER_FIBER_RPC = os.environ.get("USER_FIBER_RPC_URL", "http://localhost:8237")
+
+
+async def agent_info(request: Request) -> JSONResponse:
+	"""
+	GET /agent/info
+	Return the agent Fiber node's connection details so users can
+	connect their own node and open a channel.
+	"""
+	if not fiber:
+		return JSONResponse({"error": "Fiber not configured."}, status_code=503)
+	try:
+		info = await fiber.node_info()
+	except Exception as e:
+		return JSONResponse({"error": f"Failed to get node info: {e}"}, status_code=502)
+
+	# Peer ID from node addresses or environment override
+	peer_id = AGENT_PEER_ID
+	addresses = info.get("addresses", [])
+	for addr in addresses:
+		if "/p2p/" in addr:
+			peer_id = addr.split("/p2p/")[-1]
+			break
+
+	node_id = info.get("node_id", "")
+	p2p_addr = f"/ip4/{AGENT_P2P_HOST}/tcp/{AGENT_P2P_PORT}/p2p/{peer_id}" if peer_id else None
+	return JSONResponse({
+		"node_id": node_id,
+		"peer_id": peer_id or None,
+		"fiber_version": info.get("version", ""),
+		"chain": "testnet",
+		"p2p_addr": p2p_addr,
+		"rpc_note": "Agent RPC is not publicly exposed. Connect via p2p_addr.",
+		"analysis_fee_ckb": ANALYSIS_FEE_CKB,
+		"auto_accept_min_ckb": int(info.get("open_channel_auto_accept_min_ckb_funding_amount", "0x0"), 16) / SHANNON_PER_CKB if info.get("open_channel_auto_accept_min_ckb_funding_amount") else None,
+		"instructions": [
+			"1. Run your own Fiber node (fnn) on CKB testnet.",
+			"2. Connect to the agent: connect_peer with the p2p_addr above.",
+			"3. Open a channel with enough CKB to cover the analysis fee.",
+			"4. POST /request with your token — you'll get a Fiber invoice.",
+			"5. Pay the invoice from your node (send_payment).",
+			"6. Your node reveals the TLC preimage (= proof_hash) on settlement.",
+			"7. GET /proof/{proof_hash} to retrieve your results.",
+		],
+	})
+
+
+async def _user_rpc(method: str, params: list | None = None) -> dict:
+	"""Make a JSON-RPC call to the demo USER Fiber node."""
+	async with httpx.AsyncClient(timeout=30.0) as client:
+		resp = await client.post(
+			USER_FIBER_RPC,
+			json={"id": "demo", "jsonrpc": "2.0", "method": method, "params": params or []},
+			headers={"Content-Type": "application/json"},
+		)
+		body = resp.json()
+	if "error" in body and body["error"] is not None:
+		raise RuntimeError(f"User Fiber RPC error ({method}): {body['error']}")
+	return body.get("result")
+
+
+async def demo_node_status(request: Request) -> JSONResponse:
+	"""
+	GET /demo/node-status
+	Return the demo user Fiber node's status: node info, peers, channels.
+	"""
+	try:
+		node = await _user_rpc("node_info")
+		peers_result = await _user_rpc("list_peers")
+		channels_result = await _user_rpc("list_channels", [{}])
+	except Exception as e:
+		return JSONResponse({"error": f"User node unavailable: {e}"}, status_code=502)
+
+	peers = peers_result.get("peers", [])
+	channels = []
+	agent_channel = None
+	for ch in channels_result.get("channels", []):
+		info = {
+			"channel_id": ch["channel_id"],
+			"peer_id": ch["peer_id"],
+			"state": ch["state"]["state_name"],
+			"local_balance_ckb": round(int(ch["local_balance"], 16) / SHANNON_PER_CKB, 1),
+			"remote_balance_ckb": round(int(ch["remote_balance"], 16) / SHANNON_PER_CKB, 1),
+		}
+		channels.append(info)
+		if ch["peer_id"] == AGENT_PEER_ID and ch["state"]["state_name"] == "CHANNEL_READY":
+			agent_channel = info
+
+	return JSONResponse({
+		"node_id": node.get("node_id", ""),
+		"peer_count": len(peers),
+		"peers": [{"peer_id": p["peer_id"], "address": p.get("address", "")} for p in peers],
+		"channel_count": len(channels),
+		"channels": channels,
+		"agent_peer_id": AGENT_PEER_ID,
+		"connected_to_agent": any(p["peer_id"] == AGENT_PEER_ID for p in peers),
+		"agent_channel_ready": agent_channel is not None,
+		"agent_channel": agent_channel,
+	})
+
+
+async def demo_connect(request: Request) -> JSONResponse:
+	"""
+	POST /demo/connect
+	Connect the demo user node to the agent node via connect_peer.
+	"""
+	if not AGENT_PEER_ID:
+		return JSONResponse({"error": "Agent peer ID not configured."}, status_code=500)
+
+	multiaddr = f"/ip4/{AGENT_P2P_HOST}/tcp/{AGENT_P2P_PORT}/p2p/{AGENT_PEER_ID}"
+	try:
+		await _user_rpc("connect_peer", [{"address": multiaddr}])
+		return JSONResponse({"status": "connected", "address": multiaddr})
+	except RuntimeError as e:
+		# "already connected" is fine
+		if "already" in str(e).lower():
+			return JSONResponse({"status": "already_connected", "address": multiaddr})
+		return JSONResponse({"error": str(e)}, status_code=502)
+	except Exception as e:
+		return JSONResponse({"error": f"Connect failed: {e}"}, status_code=502)
+
+
+async def demo_open_channel(request: Request) -> JSONResponse:
+	"""
+	POST /demo/open-channel
+	Open a payment channel from the demo user node to the agent.
+	Body (optional): { "funding_ckb": 200 }
+	"""
+	try:
+		body = await request.json()
+	except Exception:
+		body = {}
+
+	funding_ckb = body.get("funding_ckb", 200)
+	funding_hex = hex(int(funding_ckb * SHANNON_PER_CKB))
+
+	if not AGENT_PEER_ID:
+		return JSONResponse({"error": "Agent peer ID not configured."}, status_code=500)
+
+	try:
+		result = await _user_rpc("open_channel", [{
+			"peer_id": AGENT_PEER_ID,
+			"funding_amount": funding_hex,
+		}])
+		return JSONResponse({
+			"status": "channel_opening",
+			"temporary_channel_id": result.get("temporary_channel_id", ""),
+			"funding_ckb": funding_ckb,
+		})
+	except RuntimeError as e:
+		return JSONResponse({"error": str(e)}, status_code=502)
+	except Exception as e:
+		return JSONResponse({"error": f"Open channel failed: {e}"}, status_code=502)
+
+
+async def demo_pay(request: Request) -> JSONResponse:
+	"""
+	POST /demo/pay
+	Simulate user paying a Fiber invoice from the local demo user node.
+	For hackathon demo only — in production the user pays from their own node.
+
+	Body: { "invoice": "fibt1..." }
+	"""
+	try:
+		body = await request.json()
+	except Exception:
+		return JSONResponse({"error": "Invalid JSON body."}, status_code=400)
+
+	invoice = body.get("invoice", "").strip()
+	if not invoice:
+		return JSONResponse({"error": "invoice is required."}, status_code=400)
+
+	try:
+		async with httpx.AsyncClient(timeout=15.0) as client:
+			resp = await client.post(
+				USER_FIBER_RPC,
+				json={
+					"id": "demo-pay",
+					"jsonrpc": "2.0",
+					"method": "send_payment",
+					"params": [{"invoice": invoice}],
+				},
+				headers={"Content-Type": "application/json"},
+			)
+			result = resp.json()
+
+		if "error" in result and result["error"] is not None:
+			return JSONResponse({"error": f"Payment failed: {result['error']}"}, status_code=502)
+
+		return JSONResponse({
+			"status": "payment_sent",
+			"payment_hash": result["result"]["payment_hash"],
+		})
+	except Exception as e:
+		return JSONResponse({"error": f"Payment error: {e}"}, status_code=502)
+
+
+async def demo_preimage(request: Request) -> JSONResponse:
+	"""
+	GET /demo/preimage/{payment_hash}
+	Demo-only: return the proof_hash (TLC preimage) for a settled payment.
+
+	In production, the user's Fiber node learns the preimage automatically
+	when the TLC settles. This endpoint simulates that for the web demo.
+	"""
+	payment_hash = request.path_params["payment_hash"]
+	pending = pending_requests.get(payment_hash)
+	if not pending:
+		return JSONResponse({"error": "Not found."}, status_code=404)
+	if pending["status"] != "settled":
+		return JSONResponse({"error": "Payment not yet settled.", "status": pending["status"]}, status_code=409)
+	return JSONResponse({"proof_hash": pending["proof_hash"]})
+
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
+STATIC_DIR = Path(__file__).parent / "static"
+
+
+async def index(request: Request) -> HTMLResponse:
+	"""Serve the frontend dashboard."""
+	return HTMLResponse((STATIC_DIR / "index.html").read_text())
+
+
 app = Starlette(
 	routes=[
+		Route("/", index, methods=["GET"]),
 		Route("/health", health, methods=["GET"]),
 		Route("/request", request_analysis, methods=["POST"]),
 		Route("/analyze", analyze_endpoint, methods=["POST"]),
+		Route("/agent/info", agent_info, methods=["GET"]),
+		Route("/demo/node-status", demo_node_status, methods=["GET"]),
+		Route("/demo/connect", demo_connect, methods=["POST"]),
+		Route("/demo/open-channel", demo_open_channel, methods=["POST"]),
+		Route("/demo/pay", demo_pay, methods=["POST"]),
+		Route("/demo/preimage/{payment_hash}", demo_preimage, methods=["GET"]),
 		Route("/result/{request_id}", get_result, methods=["GET"]),
 		Route("/proof/{proof_hash}", get_proof, methods=["GET"]),
+		Mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static"),
 	],
 )
 
