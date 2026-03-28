@@ -1,8 +1,25 @@
 # CKB Alpha Agent — Verifiable Alpha Oracle
 
-An autonomous AI agent that monitors token momentum via statistical analysis, accepts micropayments over the Fiber Network (CKB L2), and publishes verifiable proof cells on CKB L1.
+An autonomous AI agent that monitors token momentum via statistical analysis, accepts micropayments over the **Fiber Network (CKB L2)**, and delivers results trustlessly via **TLC preimage exchange**.
 
-**Pay → Analyze → Prove.**
+**Analyze → Pay → Prove.** No trust required.
+
+## Demo
+
+<!-- To make the video play inline: edit this README on GitHub, delete this comment, and drag demo.mp4 into the editor -->
+
+[**Watch the demo (demo.mp4)**](demo.mp4)
+
+> Fiber node setup → Token analysis → TLC payment → Preimage reveal → Verifiable proof
+
+## How It Works (Trustless Flow)
+
+1. **Agent runs analysis first** — fetches trades, computes statistical moments, generates `proof_hash`
+2. **Invoice created** — `proof_hash` becomes the TLC preimage in the Fiber invoice
+3. **User pays** — TLC settles on CKB Fiber Network, revealing `proof_hash` to the user's node
+4. **User fetches results** — `GET /proof/{proof_hash}` returns the full analysis
+
+The agent can't collect payment without revealing the proof. The user can't get the proof without paying. **Atomic exchange.**
 
 ## Architecture
 
