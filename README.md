@@ -6,9 +6,7 @@ An autonomous AI agent that monitors token momentum via statistical analysis, ac
 
 ## Demo
 
-<!-- To make the video play inline: edit this README on GitHub, delete this comment, and drag demo.mp4 into the editor -->
-
-[**Watch the demo (demo.mp4)**](demo.mp4)
+[![Watch the Demo](https://img.shields.io/badge/Watch_Demo-Streamable-blue?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik04IDV2MTRsMTEtN3oiLz48L3N2Zz4=)](https://streamable.com/svm8vw)
 
 > Fiber node setup → Token analysis → TLC payment → Preimage reveal → Verifiable proof
 
